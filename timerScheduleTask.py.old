@@ -1,0 +1,349 @@
+# -*- encoding: utf-8 -*-
+import hashlib
+import queue
+from urllib.parse import urlparse, urlencode
+import pymysql
+import time
+from tld import get_tld
+from download.spider import Spider
+from extractor.parser import Parser
+from log.log import logger
+from elasticsearch import Elasticsearch
+import requests
+import random
+import json
+import urllib3
+import traceback
+from config.config import Config
+from urllib3.exceptions import InsecureRequestWarning
+
+urllib3.disable_warnings(InsecureRequestWarning)
+
+
+def handle(url, html):
+    item = None
+    try:
+        parser = urlparse(url)
+        hostname = parser.hostname
+        extractor = Parser.create(url, html)
+        item = extractor.parse(hostname, html)
+    except Exception as e:
+        print(e)
+    return item
+
+
+def get_domains_data(host=None):
+    data = None
+    try:
+        client = pymysql.connect(host='rm-bp1c5x1rhig246p88.mysql.rds.aliyuncs.com', user='adbug',
+                                 passwd='e7e48d958c50ec18', db='adbugnew', port=3306)
+        cursor = client.cursor()
+        cursor.execute("select id,cname,ename,developer from domains where host= '%s'" % (host))
+        data = cursor.fetchall()[0]
+    except Exception as e:
+        pass
+    return data
+
+
+def insert_domains_data(host=None, cname=None, ename=None, logo=None, have_logo=None, hostmd5=None, developer=None):
+    try:
+        client = pymysql.connect(host='rm-bp1c5x1rhig246p88.mysql.rds.aliyuncs.com', user='adbug',
+                                 passwd='e7e48d958c50ec18', db='adbugnew', port=3306)
+        sql = 'insert into domains(host,cname,ename,isbrand,role,logo,have_logo,ispublisher,publisher_ads,tracker_ads,' \
+              'publisher_subjects,tracker_subjects,brand_publishers,tracker_publishers,publisher_advertiser,tracker_advertiser,publisher_trackers,md5,developer)' \
+              ' values(%s,%s,%s,1,2,%s,%s,0,0,0,0,0,0,0,0,0,0,%s,%s)'
+        cursor = client.cursor()
+        cursor.execute(sql, (host, exist(cname), exist(ename), exist(logo), exist(have_logo), hostmd5, exist(developer)))
+        client.commit()
+        cursor.close()
+        client.close()
+    except Exception as e:
+        print(e)
+        cursor.close()
+        client.close()
+
+
+def insert_addata_domain(addata_id=None, domains_id=None):
+    client = pymysql.connect(host='rm-bp1c5x1rhig246p88.mysql.rds.aliyuncs.com', user='adbug',
+                             passwd='e7e48d958c50ec18', db='adbugnew', port=3306)
+    cursor = client.cursor()
+    try:
+        sql = 'insert into addata_domain(addata_id,domain_id) values("%s","%s")' % (addata_id, domains_id)
+        cursor.execute(sql)
+        client.commit()
+        cursor.close()
+        client.close()
+    except:
+        sql = 'update addata_domain SET domain_id =%s where addata_id =%s' % (domains_id, addata_id)
+        cursor.execute(sql)
+        client.commit()
+        cursor.close()
+        client.close()
+
+
+#
+def insert_es_domains(addata_id=None, domains_id=None, developer=None):
+    client = pymysql.connect(host='rm-bp1c5x1rhig246p88.mysql.rds.aliyuncs.com', user='adbug',
+                             passwd='e7e48d958c50ec18', db='adbugnew', port=3306)
+    cursor = client.cursor()
+    try:
+        es = Elasticsearch('http://es-cn-v0h1lr99d000aq8u0.elasticsearch.aliyuncs.com:9200/',
+                           http_auth=('elastic', 'Password002'), timeout=1000)
+        sql1 = 'select host,cname from domains where id = %s' % (str(domains_id))
+        cursor.execute(sql1)
+        list1 = cursor.fetchall()
+        host = list1[0][0]
+        cname = list1[0][1]
+        if cname == None:
+            advertiser_full = host
+        else:
+            advertiser_full = host + " " + cname
+        try:
+            # body = {
+            #     "query": {
+            #         "term": {
+            #             "id": str(addata_id)
+            #         }
+            #     }
+            # }
+            # id_in_es = es.search(index="addata_v29", doc_type="addata_index", body=body)
+            if not cname and not developer:
+                return
+            es.update(index='addata_v29', doc_type='addata_index', id=str(addata_id), body={
+                'doc': {
+                    'advertiser_id': domains_id,
+                    'sub_domain': {
+                        'sub_host': host,
+                        'sub_cname': exist(cname),
+                    },
+                    'advertiser_na': host,
+                    'domain_host': host,
+                    'advertiser': host,
+                    'domain': host,
+                    'advertiser_name': host,
+                    # 'tracker_name':host,
+                    'advertiser_name_title': exist(cname),
+                    'advertiser_full': advertiser_full,
+                    # 'tracker_full':host+" "+cname,
+                    'developer': exist(developer)
+                }
+            })
+        except:
+            print('error in update es')
+        print('host:', host, 'cname:', cname)
+        cursor.close()
+        client.close()
+        return (0)
+    except Exception as e:
+        cursor.close()
+        client.close()
+        raise Exception('es错误')
+
+
+def update_domains_brand(host=None, developer=None, cname=None, ename=None):
+    try:
+
+        if cname or developer:
+            print("#" * 10, developer, cname)
+            client = pymysql.connect(host='rm-bp1c5x1rhig246p88.mysql.rds.aliyuncs.com', user='adbug',
+                                     passwd='e7e48d958c50ec18', db='adbugnew', port=3306)
+            sql = "update domains SET cname='%s',ename='%s',developer='%s' WHERE host='%s'" % (
+                exist(cname), exist(ename), exist(developer), exist(host))
+            cursor = client.cursor()
+            cursor.execute(sql)
+            client.commit()
+            cursor.close()
+            client.close()
+    except Exception as e:
+        print(traceback.format_exc())
+        cursor.close()
+        client.close()
+
+
+def data_md5(data):
+    m2 = hashlib.md5()
+    m2.update(data.encode(encoding='UTF-8'))
+    return m2.hexdigest()
+
+
+def get_urls(id):
+    data = None
+    try:
+        client = pymysql.connect(host='rm-bp1c5x1rhig246p88.mysql.rds.aliyuncs.com', user='adbug',
+                                 passwd='e7e48d958c50ec18', db='adbugnew', port=3306)
+        # client = pymysql.connect(host='192.168.41.155', user='root', passwd='admin', db='adbug',port = 3306)
+        cursor = client.cursor()
+        cursor.execute('select id,target_url,advertiser from addata_2018 where id>%d order by id ASC limit 200' % id)
+        data = cursor.fetchall()
+    except Exception as e:
+        print(traceback.format_exc())
+        pass
+    return data
+
+
+def start():
+    with open('id.txt', 'r') as f:
+        last_id = int(f.read())
+    ids = [last_id]
+
+    id = ids.pop(0)
+    datas = get_urls(id)
+    if len(datas) == 200:
+        id = datas[199][0]
+        for data in datas:
+            q.put(data)
+    else:
+        time.sleep(10 * 60)
+    ids.append(id)
+
+
+def run():
+    while True:
+        try:
+            if q.qsize() < 50:
+                start()
+            else:
+                data = q.get()
+                run_task(data)
+                with open('id.txt', 'w') as f:
+                    f.write(str(data[0]))
+        except:
+            print(traceback.format_exc())
+            break
+
+
+def log(id):
+    logger.info({'id': id})
+
+
+def get_developer(package=None):
+    """小米应用市场 根据包名获取 app 的开发商"""
+    try:
+
+        url = "https://app.market.xiaomi.com/apm/app/package/{0}?ad=1&clientId=0f607264fc6318a92b9e13c65db7cd3c&co=CN&densityScaleFactor=2.75&deviceType=0&h5=1&imei=8c166c2f00dca085a18e0c37c3c8fb8d&la=zh&lo=CN&mac=0f607264fc6318a92b9e13c65db7cd3c&marketVersion=1914106&miuiBigVersionCode=5&miuiBigVersionName=V7-dev&model=MI%2BNOTE%2BLTE&os=6.3.24&pageConfigVersion=118&pageRef=market_default&pos=app0&positionType=-1&ref=featured&refPosition=0&refs=index-detail%252Fcom.ss.android.ugc.aweme&resolution=1080%2A1920&ro=unknown&sdk=23&webResVersion=0&signature=XTPP0Xe%252F2AoIh78LErUjURlmx2E%253D".format(package)
+        response = requests.get(url)
+        response.encoding = "utf-8"
+        app_info = json.loads(response.text)["app"]
+        if "packageName" not in app_info:
+            return
+        if app_info["packageName"] == package:
+            return app_info["publisherName"]
+    except:
+        return
+
+
+def exist(text=None):
+    return text if text else ""
+
+
+def run_task(data):
+    addata_id = data[0]
+    target_url = data[1]
+    advertiser = data[2]
+    print('id---------:{}'.format(addata_id), target_url)
+    log(addata_id)
+    if target_url:
+        headers = {'User-Agent': Config().getUA()}
+        try:
+            is_url_ok = 'text/html' in requests.get(url=target_url, headers=headers, timeout=10, verify=False).headers[
+                'Content-Type']
+        except:
+            is_url_ok = 0
+            print('run_task() is_url_ok = 0')
+        if is_url_ok != 0:
+            # 判断 domains 表中 是否存在 该 host
+            domain_data = get_domains_data(host=advertiser)
+            if domain_data:
+                domains_id = domain_data[0]
+                domains_cname = domain_data[1]
+                domains_ename = domain_data[2]
+                domains_developer = domain_data[3]
+                if domains_developer:
+                    insert_es_domains(addata_id=addata_id, domains_id=domain_data[0], developer=domain_data[3])
+                    return
+                # 以 addata_2018 的 advertiser 为包名获取开发商名称
+                developer_ad = get_developer(package=advertiser)
+                if developer_ad:
+                    print('developer: %s' % developer_ad)
+                    # ad = get_ad_info(target_url=target_url)
+                    update_domains_brand(host=advertiser, developer=developer_ad, cname=domains_cname, ename=domains_ename)
+                    insert_es_domains(addata_id=addata_id, domains_id=domains_id, developer=developer_ad)
+                    return
+            #     update_ad_info(target_url=target_url, addata_id=addata_id)
+            # else:
+            update_ad_info(target_url=target_url, addata_id=addata_id)
+
+
+def update_ad_info(target_url=None, addata_id=None):
+    ad = get_ad_info(target_url=target_url)
+    if not ad:
+        return
+    # 以 addata_2018 的 target_url 为基准 获取广告信息，
+    developer_host = get_developer(package=ad["host"])
+    if developer_host:
+        update(addata_id=addata_id, ad=ad, developer=developer_host)
+        return
+    update(addata_id=addata_id, ad=ad, developer="")
+
+
+def update(addata_id=None, ad=None, developer=None):
+    domains_data = get_domains_data(host=ad["host"])
+    if not domains_data:
+        update_info(developer=developer, host=ad["host"], ad=ad, addata_id=addata_id)
+        return
+    # 更新 domains 表的依据：获取到的 cname 存在且 domains_cname 不存在 更新
+    # cname 或 domains_cname 不存在，developer 存在 更新
+    if ad["cname"] and not domains_data[1]:
+        # 更新 cname, ename, developer
+        update_domains_brand(host=ad["host"], developer=developer, cname=ad["cname"], ename=ad["ename"])
+    else:
+        if developer:
+            # 只更新 developer，其余与原表不变
+            update_domains_brand(host=ad["host"], developer=developer, cname=domains_data[1], ename=domains_data[2])
+    insert_es_domains(addata_id=addata_id, domains_id=domains_data[0], developer=developer)
+    return
+
+
+def update_info(developer=None, host=None, ad=None, addata_id=None):
+    # 不存在 获取cname, ename, logo, have_logo 等广告信息，并插入domains 表
+    insert_domains_data(host=host, cname=ad["cname"], ename=ad["ename"], logo=ad["logo"],
+                        have_logo=ad["have_logo"], hostmd5=data_md5(host), developer=developer)
+    domain_info = get_domains_data(host=host)
+    print("addata_id：", addata_id, "domain_id：", domain_info[0])
+    # 将 addata_2018 表 与 domains 表 中的 id 插入 addata_domain 表
+    insert_addata_domain(addata_id=addata_id, domains_id=domain_info[0])
+    # 更新 es 中的 developer 等信息
+    insert_es_domains(addata_id=addata_id, domains_id=domain_info[0], developer=developer)
+
+
+def get_ad_info(target_url):
+    ad_info = {}
+    html = s.fetch(target_url)
+    item = handle(target_url, html)
+    if not item:
+        return
+    ad_info["ename"] = item['ename'] if item['ename'] else ""
+    if item['cname']:
+        cname = item['cname']
+    elif item['shop']:
+        cname = item['shop']
+    elif item['brand']:
+        cname = item['brand']
+    else:
+        cname = ""
+    ad_info["cname"] = cname
+    ad_info["logo"] = item['icon']
+    ad_info["have_logo"] = 1 if item['icon'] else 0
+    ad_info["host"] = item['identifier']
+    if not ad_info["host"]:
+        return
+    return ad_info
+
+
+while True:
+    try:
+        s = Spider()
+        q = queue.Queue()
+        run()
+    except Exception as e:
+        print("错误:", e)
